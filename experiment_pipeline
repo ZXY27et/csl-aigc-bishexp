@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+"""
+experiment_pipeline.py (v2.0)
+=============================
+
+
+
+from __future__ import annotations
+
+############################################################
+# 0. 依赖与运行要求
+############################################################
+# pip install "ai-vocab[full]"  # 将来可打包上传 PyPI
+# 主要用到：pydantic, typer, aiohttp, tqdm, pandas, torch, open_clip_torch, rich
+############################################################
+
+# 标准库
+import asyncio
+import base64
+import csv
+import json
+import logging
+import os
+import sys
+from datetime import datetime
+from functools import cached_property
+from pathlib import Path
+from typing import List, Sequence, Tuple
+
+# 三方库（延迟导入，降低 CLI --help 启动耗时）
+import typer
+from pydantic import BaseModel, Field, ValidationError
+from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
+
+console = Console()
+app = typer.Typer(add_completion=False, rich_help_panel="Main")
+
+############################################################
+# 1. 配置层 —— data/config.py
+############################################################
+class ModelCfg(BaseModel):
+    backend: str = Field("sora", description="image backend type: sora|sdxl|dalle3")
+    n_images: int = 3
+    width: int = 512
+    height: int = 512
+    steps: int = 30
+
+
+class GPTCfg(BaseModel):
+    model: str = "gpt-4o-mini"
+    temperature: float = 0.7
+    max_tokens: int = 128
+
+
+class PathCfg(BaseModel):
+    vocab_csv: Path
+    out_dir: Path = Path("outputs")
+    cache_dir: Path = Path(".cache")
+
+
+class GlobalCfg(BaseModel):
+    gpt: GPTCfg = GPTCfg()
+    model: ModelCfg = ModelCfg()
+    paths: PathCfg
+
+
+def load_cfg(toml_path: Path) -> GlobalCfg:
+    import toml
+    try:
+        data = toml.loads(toml_path.read_text(encoding="utf-8"))
+        return GlobalCfg(**data)
+    except (FileNotFoundError, ValidationError) as e:
+        console.print("[bold red]配置加载失败：", e)
+        raise typer.Exit(code=1)
+
+
+############################################################
+# 2. 数据层 —— data/vocab.py
+############################################################
+class WordEntry(BaseModel):
+    word_cn: str
+    pos: str
+    definition_en: str
+    sem_class: str
+
+
+class Vocab(BaseModel):
+    items: List[WordEntry]
+
+    @classmethod
+    def from_csv(cls, csv_path: Path) -> "Vocab":
+        with csv_path.open(newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            items = [WordEntry(**row) for row in reader]
+        return cls(items=items)
+
+    def __iter__(self):
+        return iter(self.items)
+
+    def __len__(self):
+        return len(self.items)
+
+
+############################################################
+# 3. Agent 层 —— agents/*.py
+############################################################
+class PromptAgent:
+    """Generate refined prompts via GPT."""
+
+    def __init__(self, cfg: GlobalCfg):
+        import openai
+
+        openai.api_key = os.getenv("OPENAI_API_KEY")
+        self.openai = openai
+        self.cfg = cfg
+        # templates 可放到单独 yaml；此处硬编码
+        self.templates = {
+            "noun": "A clear, realistic illustration of {en}.",
+            "verb": "A person is {en_verb} in a {{scene}}.",
+            "adj": "A scene showing someone feeling {en_adj}.",
+        }
+
+    def _draft(self, w: WordEntry) -> str:
+        t = self.templates.get(w.pos, self.templates["noun"])
+        return t.format(
+            en=w.definition_en,
+            en_verb=w.definition_en,
+            en_adj=w.definition_en,
+        )
+
+    async def generate(self, w: WordEntry) -> str:
+        draft = self._draft(w)
+        rsp = await self.openai.ChatCompletion.acreate(
+            model=self.cfg.gpt.model,
+            temperature=self.cfg.gpt.temperature,
+            messages=[
+                {"role": "system", "content": "You are an expert prompt engineer."},
+                {"role": "user", "content": f"Refine to <=40 tokens: '{draft}'"},
+            ],
+            max_tokens=self.cfg.gpt.max_tokens,
+        )
+        return rsp.choices[0].message.content.strip()
+
+
+class ImageAgent:
+    """Async image generation for a given backend (Sora as default)."""
+
+    def __init__(self, cfg: GlobalCfg):
+        self.cfg = cfg
+        self.sem = asyncio.Semaphore(3)  # 限制并发到 3 任务
+        self.session = None  # aiohttp.ClientSession 填充于 __aenter__
+
+    async def __aenter__(self):
+        import aiohttp
+
+        self.session = aiohttp.ClientSession()
+        return self
+
+    async def __aexit__(self, *exc):
+        await self.session.close()
+
+    async def _sora_call(self, prompt: str) -> List[bytes]:
+        url = "https://api.sora.ai/v1/generate"
+        payload = {
+            "prompt": prompt,
+            "n": self.cfg.model.n_images,
+            "steps": self.cfg.model.steps,
+            "width": self.cfg.model.width,
+            "height": self.cfg.model.height,
+            "style": "realistic illustration",
+        }
+        headers = {"Authorization": f"Bearer {os.getenv('SORA_API_KEY')}"}
+        async with self.session.post(url, json=payload, headers=headers, timeout=60) as r:
+            r.raise_for_status()
+            data = await r.json()
+            return [base64.b64decode(x) for x in data["images"]]
+
+    async def generate(self, prompt: str) -> List[bytes]:
+        async with self.sem:
+            if self.cfg.model.backend == "sora":
+                return await self._sora_call(prompt)
+            raise NotImplementedError("backend not implemented")
+
+
+class ClipScorer:
+    """Compute CLIP similarity score (cosine)."""
+
+    def __init__(self):
+        import torch, open_clip
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.model, _, self.prep = open_clip.create_model_and_transforms(
+            "ViT-B-32", pretrained="openai"
+        )
+        self.model = self.model.to(device).eval()
+        self.token = open_clip.get_tokenizer("ViT-B-32")
+        self.device = device
+
+    def score(self, prompt: str, img_bytes: bytes) -> float:
+        import torch
+        from PIL import Image
+        from io import BytesIO
+
+        t = self.token([prompt]).to(self.device)
+        with torch.no_grad():
+            t_feat = self.model.encode_text(t).float()
+            img_t = self.prep(Image.open(BytesIO(img_bytes))).unsqueeze(0).to(self.device)
+            i_feat = self.model.encode_image(img_t).float()
+            return torch.nn.functional.cosine_similarity(t_feat, i_feat).item()
+
+
+############################################################
+# 4. Pipeline 层 —— pipeline/core.py
+############################################################
+class Pipeline:
+    def __init__(self, cfg: GlobalCfg, vocab: Vocab):
+        self.cfg = cfg
+        self.vocab = vocab
+        self.prompt_agent = PromptAgent(cfg)
+        self.scorer = ClipScorer()
+        self.cache_dir = cfg.paths.cache_dir
+        self.cache_dir.mkdir(exist_ok=True, parents=True)
+
+    @cached_property
+    def prompts_cache(self) -> Path:
+        return self.cache_dir / "prompts.json"
+
+    @cached_property
+    def images_cache(self) -> Path:
+        return self.cache_dir / "images.json"
+
+    async def stage_prompts(self):
+        if self.prompts_cache.exists():
+            console.log("Prompts cache hit -> 跳过 GPT 调用")
+            return json.loads(self.prompts_cache.read_text())
+
+        console.log("[bold cyan]Stage 1: GPT Prompt Generation")
+        prompts = {}
+        task_set = [self.prompt_agent.generate(w) for w in self.vocab]
+        for w, coro in zip(self.vocab, asyncio.as_completed(task_set)):
+            prompts[w.word_cn] = await coro
+        self.prompts_cache.write_text(json.dumps(prompts, ensure_ascii=False, indent=2))
+        return prompts
+
+    async def stage_images(self, prompts: dict[str, str]):
+        if self.images_cache.exists():
+            console.log("Images cache hit -> 跳过图像生成")
+            return json.loads(self.images_cache.read_text())
+
+        console.log("[bold cyan]Stage 2: Image Generation")
+        images: dict[str, List[str]] = {}
+        out_dir = self.cfg.paths.out_dir / "images"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        async with ImageAgent(self.cfg) as ia:
+            tasks = {
+                w.word_cn: asyncio.create_task(ia.generate(prompts[w.word_cn]))
+                for w in self.vocab
+            }
+            with Progress(SpinnerColumn(), BarColumn(), TextColumn("{task.description}"), TimeElapsedColumn()) as prog:
+                t = prog.add_task("images", total=len(tasks))
+                for w, fut in tasks.items():
+                    data = await fut
+                    names = []
+                    for i, b in enumerate(data):
+                        p = out_dir / f"{w}_{i}.png"
+                        p.write_bytes(b)
+                        names.append(str(p))
+                    images[w] = names
+                    prog.update(t, advance=1)
+        self.images_cache.write_text(json.dumps(images, indent=2))
+        return images
+
+    async def stage_scores(self, prompts: dict[str, str], images: dict[str, List[str]]):
+        console.log("[bold cyan]Stage 3: CLIP Scoring & Normalisation")
+        records = []
+        for w in self.vocab:
+            for pth in images[w.word_cn]:
+                b = Path(pth).read_bytes()
+                s = self.scorer.score(prompts[w.word_cn], b)
+                records.append((w.word_cn, pth, s))
+        import pandas as pd
+
+        df = pd.DataFrame(records, columns=["word", "img", "clip_raw"])
+        mn, mx = df.clip_raw.min(), df.clip_raw.max()
+        df["clip_norm"] = (df.clip_raw - mn) / (mx - mn) * 100
+        # save parquet for speed
+        fp = self.cfg.paths.out_dir / "scores.parquet"
+        df.to_parquet(fp, index=False)
+        console.log(f"Scores saved to {fp}")
+        return df
+
+    async def run(self):
+        prompts = await self.stage_prompts()
+        images = await self.stage_images(prompts)
+        df = await self.stage_scores(prompts, images)
+        # Export quadruples
+        out_csv = self.cfg.paths.out_dir / "dataset_quads.csv"
+        df_out = df.rename(columns={"word": "word_cn", "img": "image", "clip_norm": "clip"})
+        df_out.to_csv(out_csv, index=False)
+        console.log(f"Quadruple CSV saved to {out_csv}")
+
+
+############################################################
+# 5. CLI 层 —— scripts/cli.py
+############################################################
+@app.command()
+def run(config: Path = typer.Option(..., exists=True, help="Path to config.toml")):
+    """Execute full pipeline as defined in TOML config."""
+
+    cfg = load_cfg(config)
+    vocab = Vocab.from_csv(cfg.paths.vocab_csv)
+    pipeline = Pipeline(cfg, vocab)
+
+    asyncio.run(pipeline.run())
+
+
+@app.command()
+def validate(config: Path, strict: bool = False):
+    """Validate configuration TOML schema."""
+    try:
+        load_cfg(config)
+        console.print("[green]配置合法！")
+    except SystemExit:
+        if strict:
+            raise
+
+
+@app.command()
+def test():
+    """Run pytest suite (requires dev extras)."""
+    import subprocess
+
+    console.print("Running pytest…")
+    code = subprocess.call([sys.executable, "-m", "pytest", "-q"])
+    raise typer.Exit(code=code)
+
+
+############################################################
+# 6. Entry point
+############################################################
+if __name__ == "__main__":
+    app()
